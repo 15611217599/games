@@ -1,0 +1,98 @@
+# K3S 集群部署配置 - 域名: util3.commonutil.com
+
+# 步骤1: 安装 K3S 主节点 (版本 v1.32.7+k3s1)
+# 下载并安装 k3s，这会自动启动 k3s 服务并配置为主节点
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.32.7+k3s1 sh -
+
+# 步骤2: 生成工作节点加入命令
+# 显示其他节点加入集群时需要执行的命令，包含主节点IP和token
+echo "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=v1.32.7+k3s1 K3S_URL=https://$(hostname -I | awk '{print $1}'):6443 K3S_TOKEN=$(sudo cat /var/lib/rancher/k3s/server/node-token) sh -"
+
+# 步骤3: 安装 Helm 包管理器
+# 使用 snap 安装 helm，--classic 参数允许访问系统资源
+snap install helm --classic
+
+# 步骤4: 配置 kubectl 环境变量
+# 编辑 bash 配置文件，设置 KUBECONFIG 环境变量指向 k3s 的配置文件
+echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' >> ~/.bashrc && source ~/.bashrc
+
+
+# 步骤5: 安装 cert-manager (证书管理器)
+# 添加 jetstack 的 helm 仓库，cert-manager 就在这个仓库中
+helm repo add jetstack https://charts.jetstack.io
+# 更新 helm 仓库信息，获取最新的 chart 版本
+helm repo update
+# 安装 cert-manager，用于自动管理 TLS 证书
+helm install \
+  cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set crds.enabled=true
+
+
+# 步骤6: 创建 Let's Encrypt 证书签发器
+# 配置 cert-manager 使用 Let's Encrypt 自动签发免费 SSL 证书
+kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer                # 资源类型，集群级别的证书签发器
+metadata:
+  name: letsencrypt-prod           # 这个签发器的名字，后续 Ingress 里会用到
+spec:
+  acme:                            # 使用 ACME 协议（Let's Encrypt 就是 ACME 协议的实现）
+    server: https://acme-v02.api.letsencrypt.org/directory  # Let's Encrypt 生产环境地址
+    email: 15611217599@163.com     # 你的邮箱，证书到期等通知会发到这里
+    privateKeySecretRef:
+      name: letsencrypt-prod       # 保存 ACME 账户私钥的 Secret 名称
+    solvers:                       # 证书验证方式
+    - http01:                      # 使用 HTTP-01 方式验证域名所有权
+        ingress:
+          class: traefik           # 使用 k3s 自带的 Traefik 作为 ingress controller
+EOF
+
+
+# 步骤7: 安装 Rancher 管理平台
+# 添加 Rancher 稳定版本 helm 仓库
+helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+# 安装 Rancher，这是一个 Kubernetes 集群管理界面
+helm install rancher rancher-stable/rancher \
+  --namespace cattle-system \
+  --create-namespace \
+  --set hostname=util3.commonutil.com \
+  --set bootstrapPassword="xiaohuanxiongsS#" \
+  --set ingress.enabled=false \
+  --set tls=external
+# 步骤8: 创建 Rancher 的 Ingress 资源
+# 配置外部访问路由，使用 k3s 自带的 Traefik 作为负载均衡器
+# 同时配置自动 HTTPS 证书和域名访问
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rancher-ingress
+  namespace: cattle-system
+  annotations:
+    # 使用 Traefik 作为 ingress controller
+    kubernetes.io/ingress.class: traefik
+    # 启用 HTTPS 重定向，所有 HTTP 请求自动跳转到 HTTPS
+    traefik.ingress.kubernetes.io/redirect-entry-point: https
+    # 使用前面创建的 Let's Encrypt 证书签发器
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Traefik 特定配置，启用 TLS
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  tls:
+  - hosts:
+    - util3.commonutil.com         # 配置 HTTPS 证书的域名
+    secretName: rancher-tls-secret # 证书保存的 Secret 名称
+  rules:
+  - host: util3.commonutil.com     # 配置访问域名
+    http:
+      paths:
+      - path: /                    # 根路径匹配
+        pathType: Prefix           # 前缀匹配模式
+        backend:
+          service:
+            name: rancher          # 后端服务名称
+            port:
+              number: 80           # 后端服务端口
+EOF
